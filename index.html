@@ -196,7 +196,7 @@ body[data-theme="dark"] .rail-item.active{background:var(--brand);color:#fff}
 .badge.bad{background:var(--bad-bg);color:var(--bad);border-color:transparent}
 .badge.info{background:var(--info-bg);color:var(--info);border-color:transparent}
 .badge.brand{background:rgba(91,91,246,.12);color:var(--brand);border-color:transparent}
-.badge.dot::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
+.badge.badge-dot::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
 
 .chip{
   display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:99px;border:1px solid var(--border);
@@ -2037,22 +2037,6 @@ function isMe(userId){return userId===state.user?.id}
    SCREEN NAVIGATION (config → auth → org → app)
    ============================================================ */
 
-/* Dopo signUp/signInWithPassword, il client Supabase-js aggiorna gli header interni
-   in modo asincrono. Se si procede subito a un insert protetto da RLS, auth.uid()
-   può risultare ancora null lato Postgres e la policy blocca la scrittura con un
-   errore fuorviante ("violates row-level security policy"). Questa funzione forza
-   un getSession() esplicito e ritenta finché il token non è davvero disponibile. */
-async function waitForAuthReady(expectedSession,maxAttempts=6){
-  for(let i=0;i<maxAttempts;i++){
-    const {data}=await state.sb.auth.getSession();
-    if(data?.session?.access_token){
-      return data.session;
-    }
-    await new Promise(r=>setTimeout(r,150));
-  }
-  return expectedSession||null;
-}
-
 function showScreen(name){
   ['screenConfig','screenAuth','screenOrg','shell'].forEach(s=>els[s].classList.add('hidden'));
   els[name].classList.remove('hidden');
@@ -2161,7 +2145,7 @@ els.authForm.onsubmit=async(e)=>{
       if(!password){showAuthError('Inserisci la password.');return}
       const {data,error}=await state.sb.auth.signInWithPassword({email,password});
       if(error) throw error;
-      await waitForAuthReady(data.session);
+      await ensureSessionFresh();
       state.session=data.session;state.user=data.user;
       await afterLogin();
     }else if(authMode==='signup'){
@@ -2169,7 +2153,7 @@ els.authForm.onsubmit=async(e)=>{
       const {data,error}=await state.sb.auth.signUp({email,password,options:{data:{display_name:name||email.split('@')[0]}}});
       if(error) throw error;
       if(data.session){
-        await waitForAuthReady(data.session);
+        await ensureSessionFresh();
         state.session=data.session;state.user=data.user;
         await afterLogin();
       }else{
@@ -2225,8 +2209,7 @@ els.orgCreateBtn.onclick=async()=>{
   try{
     // Garantisce che il JWT sia propagato correttamente prima dell'insert (evita che
     // auth.uid() risulti null lato Postgres subito dopo un login/signup appena avvenuto).
-    const session=await waitForAuthReady(state.session);
-    if(!session) throw new Error('Sessione non valida, prova a ricaricare la pagina e accedere di nuovo.');
+    await ensureSessionFresh();
     const {data,error}=await state.sb.from('organizations').insert({name,created_by:state.user.id}).select('id').single();
     if(error) throw error;
     await loadOrgsForUser();
@@ -2241,8 +2224,7 @@ els.orgJoinBtn.onclick=async()=>{
   if(!code){showOrgError('Inserisci un codice invito.');return}
   els.orgJoinBtn.disabled=true;
   try{
-    const session=await waitForAuthReady(state.session);
-    if(!session) throw new Error('Sessione non valida, prova a ricaricare la pagina e accedere di nuovo.');
+    await ensureSessionFresh();
     const {data:org,error:findErr}=await state.sb.from('organizations').select('id,name').eq('invite_code',code).maybeSingle();
     if(findErr) throw findErr;
     if(!org){showOrgError('Nessuna organizzazione trovata con questo codice.');return}
@@ -2302,6 +2284,37 @@ async function sbInit(){
   if(!window.supabase?.createClient) throw new Error('Libreria Supabase non caricata.');
   if(!state.sb) state.sb=window.supabase.createClient(state.cfg.url,state.cfg.key);
   return state.sb;
+}
+
+/* Garantisce che il token di sessione sia davvero propagato prima di una scrittura
+   protetta da RLS. Subito dopo login/cambio organizzazione il client Supabase-js
+   può impiegare qualche centinaio di ms per aggiornare gli header interni: se si
+   scrive prima che questo avvenga, auth.uid() risulta null lato Postgres e la RLS
+   blocca la riga senza sempre restituire un errore esplicito (es. su UPDATE con
+   USING che coincide con WITH CHECK, l'update passa ma tocca 0 righe). Da chiamare
+   a inizio di ogni funzione che scrive dati sensibili all'organizzazione corrente. */
+async function ensureSessionFresh(maxAttempts=6){
+  for(let i=0;i<maxAttempts;i++){
+    const {data}=await state.sb.auth.getSession();
+    if(data?.session?.access_token) return data.session;
+    await new Promise(r=>setTimeout(r,150));
+  }
+  throw new Error('Sessione non valida: prova a ricaricare la pagina e accedere di nuovo.');
+}
+
+/* Wrapper standard per ogni scrittura (insert/update/delete) protetta da RLS.
+   Garantisce la sessione fresca PRIMA di costruire ed eseguire la query, e lancia
+   sempre un'eccezione in caso di errore invece di lasciare che un fallimento RLS
+   passi inosservato (comportamento tipico di Supabase su UPDATE: nessun errore
+   esplicito, ma 0 righe modificate). IMPORTANTE: si passa una funzione che
+   COSTRUISCE la query, non una Promise già avviata, altrimenti la richiesta
+   potrebbe partire prima che la sessione sia pronta.
+   Uso: await dbWrite(()=>state.sb.from('stores').update({...}).eq('id',id)) */
+async function dbWrite(queryBuilderFn){
+  await ensureSessionFresh();
+  const {data,error}=await queryBuilderFn();
+  if(error) throw error;
+  return data;
 }
 
 function setConn(kind,title,text){
@@ -2456,6 +2469,7 @@ async function fetchStoreImages(storeId){
 }
 
 async function uploadStoreImage(storeId,file,onProgress){
+  await ensureSessionFresh();
   const ext=(file.name.split('.').pop()||'jpg').toLowerCase();
   const path=`${state.currentOrg.organization_id}/${storeId}/${uid()}.${ext}`;
   const {error:upErr}=await state.sb.storage.from(IMG_BUCKET).upload(path,file,{cacheControl:'3600',upsert:false});
@@ -2471,28 +2485,40 @@ async function uploadStoreImage(storeId,file,onProgress){
 
   // se è la prima immagine, impostala come copertina automaticamente
   if(existing.length===0){
-    await state.sb.from('stores').update({cover_image_url:urlData.publicUrl}).eq('id',storeId);
-    const s=state.stores.find(x=>x.id===storeId);
-    if(s) s.cover_image_url=urlData.publicUrl;
+    try{
+      await dbWrite(()=>state.sb.from('stores').update({cover_image_url:urlData.publicUrl}).eq('id',storeId));
+      const s=state.stores.find(x=>x.id===storeId);
+      if(s) s.cover_image_url=urlData.publicUrl;
+    }catch(coverErr){
+      console.error('Impossibile impostare la copertina:',coverErr);
+      toast('Attenzione','Immagine caricata ma non impostata come copertina: '+coverErr.message,'warn');
+    }
   }
   await logActivity('store',storeId,storeId,'image_uploaded',{});
   return data;
 }
 
 async function deleteStoreImage(storeId,image){
-  await state.sb.storage.from(IMG_BUCKET).remove([image.storage_path]);
-  await state.sb.from('store_images').delete().eq('id',image.id);
+  await ensureSessionFresh();
+  const {error:removeErr}=await state.sb.storage.from(IMG_BUCKET).remove([image.storage_path]);
+  if(removeErr) throw removeErr;
+  const {error:delErr}=await state.sb.from('store_images').delete().eq('id',image.id);
+  if(delErr) throw delErr;
   state._storeImagesCache[storeId]=(state._storeImagesCache[storeId]||[]).filter(i=>i.id!==image.id);
   const store=state.stores.find(s=>s.id===storeId);
   if(store?.cover_image_url===image.url){
     const remaining=state._storeImagesCache[storeId];
     const newCover=remaining[0]?.url||null;
-    await state.sb.from('stores').update({cover_image_url:newCover}).eq('id',storeId);
-    if(store) store.cover_image_url=newCover;
+    try{
+      await dbWrite(()=>state.sb.from('stores').update({cover_image_url:newCover}).eq('id',storeId));
+      if(store) store.cover_image_url=newCover;
+    }catch(coverErr){
+      toast('Attenzione','Copertina non aggiornata: '+coverErr.message,'warn');
+    }
   }
 }
 async function setCoverImage(storeId,image){
-  await state.sb.from('stores').update({cover_image_url:image.url}).eq('id',storeId);
+  await dbWrite(()=>state.sb.from('stores').update({cover_image_url:image.url}).eq('id',storeId));
 }
 
 function renderImageGallery(storeId,containerEl){
@@ -2825,7 +2851,7 @@ function renderFinder(){
           </div>
         </div>
         <div class="lead-meta">
-          ${dup?'<span class="badge info dot">Già presente nel CRM</span>':'<span class="badge bad dot">Opportunity: No Website</span>'}
+          ${dup?'<span class="badge info badge-dot">Già presente nel CRM</span>':'<span class="badge bad badge-dot">Opportunity: No Website</span>'}
           <span class="badge">${p.rating||'n/d'} ★ · ${p.reviews_count||0} recensioni</span>
           <span class="badge">${p.phone?esc(p.phone):'No telefono'}</span>
           <span class="badge">${p.distance!=null?Math.round(p.distance)+' m':'Distanza n/d'}</span>
@@ -2848,6 +2874,7 @@ function renderFinder(){
 }
 
 async function saveFinder(p){
+  await ensureSessionFresh();
   const payload={
     organization_id:state.currentOrg.organization_id,
     google_place_id:p.google_place_id,name:p.name,category:p.category,address:p.address,phone:p.phone||null,website:p.website||null,
@@ -2878,11 +2905,14 @@ async function saveFinder(p){
     value:p.website?1200:800,probability:40,source:'google_places',
     notes:'Creato da Google Places',pipeline_stage_id:stage,created_by:state.user.id
   }).select('id').single();
-  if(!insL.error){
+  if(insL.error){
+    toast('Attenzione','Azienda salvata ma il lead non è stato creato: '+insL.error.message,'warn');
+  }else{
     const leadId=insL.data.id;
-    await state.sb.from('tasks').insert([
+    const {error:taskErr}=await state.sb.from('tasks').insert([
       {organization_id:state.currentOrg.organization_id,lead_id:leadId,store_id:storeId,title:'Chiama il lead',type:'call',due_at:new Date(Date.now()+86400000).toISOString(),priority:'high',created_by:state.user.id}
     ]);
+    if(taskErr) console.warn('Task di follow-up non creato:',taskErr);
     fireAutomation('lead_created',{leadId,storeId});
   }
   await logActivity('lead',storeId,storeId,'saved_from_places',{});
@@ -3024,7 +3054,7 @@ function humanizeAction(action){
 async function handleStoreDrawerAction(act,s){
   if(act==='archive'||act==='restore'){
     try{
-      await state.sb.from('stores').update({archived:act==='archive',status:act==='restore'?'active':s.status}).eq('id',s.id);
+      await dbWrite(()=>state.sb.from('stores').update({archived:act==='archive',status:act==='restore'?'active':s.status}).eq('id',s.id));
       await logActivity('store',s.id,s.id,act==='archive'?'archived':'restored',{});
       await refresh(true);toast('Aggiornato',act==='archive'?'Azienda archiviata':'Azienda ripristinata');closeDrawer();
     }catch(e){toast('Errore',e.message,'bad')}
@@ -3088,8 +3118,10 @@ function storeFormModal(s){
       };
       if(!payload.name){toast('Errore','Il nome è obbligatorio','bad');return}
       try{
+        await ensureSessionFresh();
         if(isEdit){
-          await state.sb.from('stores').update(payload).eq('id',s.id);
+          const {error}=await state.sb.from('stores').update(payload).eq('id',s.id);
+          if(error) throw error;
           await logActivity('store',s.id,s.id,'updated',{});
           await refresh(true);closeModal();closeDrawer();toast('Salvato','Azienda aggiornata');
         }else{
@@ -3178,7 +3210,7 @@ function bindKanbanDnD(){
       const stageId=col.dataset.stageDrop;
       if(!draggedId) return;
       try{
-        await state.sb.from('leads').update({pipeline_stage_id:stageId}).eq('id',draggedId);
+        await dbWrite(()=>state.sb.from('leads').update({pipeline_stage_id:stageId}).eq('id',draggedId));
         await logActivity('lead',draggedId,state.leads.find(l=>l.id===draggedId)?.store_id,'stage_changed',{stageId});
         await refresh(true);
       }catch(err){toast('Errore',err.message,'bad')}
@@ -3188,12 +3220,12 @@ function bindKanbanDnD(){
 
 async function pipeAction(act,id){
   try{
-    if(act==='lost'){await state.sb.from('leads').update({status:'lost'}).eq('id',id)}
+    if(act==='lost'){await dbWrite(()=>state.sb.from('leads').update({status:'lost'}).eq('id',id))}
     if(act==='convert'){
       const wonStage=state.stages.find(s=>s.is_won)||state.stages[state.stages.length-1];
-      await state.sb.from('leads').update({status:'won',probability:100,pipeline_stage_id:wonStage?.id}).eq('id',id);
+      await dbWrite(()=>state.sb.from('leads').update({status:'won',probability:100,pipeline_stage_id:wonStage?.id}).eq('id',id));
       const lead=state.leads.find(l=>l.id===id);
-      if(lead) await state.sb.from('stores').update({status:'client'}).eq('id',lead.store_id);
+      if(lead) await dbWrite(()=>state.sb.from('stores').update({status:'client'}).eq('id',lead.store_id));
     }
     await refresh(true);
     toast('Aggiornato','Pipeline aggiornata');
@@ -3211,7 +3243,7 @@ function stageFormModal(){
       const name=$('#f_stagename').value.trim();
       if(!name){toast('Errore','Inserisci un nome','bad');return}
       try{
-        await state.sb.from('pipeline_stages').insert({organization_id:state.currentOrg.organization_id,name,color:$('#f_stagecolor').value,sort_order:state.stages.length});
+        await dbWrite(()=>state.sb.from('pipeline_stages').insert({organization_id:state.currentOrg.organization_id,name,color:$('#f_stagecolor').value,sort_order:state.stages.length}));
         await refresh(true);closeModal();toast('Creata','Colonna aggiunta alla pipeline');
       }catch(e){toast('Errore',e.message,'bad')}
     };
@@ -3351,8 +3383,8 @@ function callFormModal(call,presetStoreId){
       const outcome=$('#f_call_outcome').value;
       const payload={organization_id:state.currentOrg.organization_id,store_id:storeId,lead_id:lead?.id||null,outcome,duration_seconds:Number($('#f_call_dur').value)||0,notes:$('#f_call_notes').value.trim(),created_by:state.user.id};
       try{
-        if(isEdit) await state.sb.from('calls').update(payload).eq('id',call.id);
-        else await state.sb.from('calls').insert(payload);
+        if(isEdit) await dbWrite(()=>state.sb.from('calls').update(payload).eq('id',call.id));
+        else await dbWrite(()=>state.sb.from('calls').insert(payload));
         if(outcome==='positive') fireAutomation('call_positive',{leadId:lead?.id,storeId});
         await logActivity('call',storeId,storeId,'call_logged',{outcome});
         await refresh(true);closeModal();toast('Salvato','Chiamata registrata e visibile a tutto il team');
@@ -3433,7 +3465,7 @@ function renderPaysDue(){
 
 async function markPaid(id){
   try{
-    await state.sb.from('payments').update({status:'paid',paid_at:new Date().toISOString(),collected_by:state.user.id}).eq('id',id);
+    await dbWrite(()=>state.sb.from('payments').update({status:'paid',paid_at:new Date().toISOString(),collected_by:state.user.id}).eq('id',id));
     const pay=state.pays.find(p=>p.id===id);
     if(pay) fireAutomation('payment_paid',{storeId:pay.store_id});
     await logActivity('payment',id,pay?.store_id,'payment_paid',{amount:pay?.amount});
@@ -3464,7 +3496,7 @@ function renderPaymentPlans(){
   }).join('');
   $$('[data-plan-toggle]').forEach(cb=>cb.onchange=async()=>{
     try{
-      await state.sb.from('payment_plans').update({active:cb.checked}).eq('id',cb.dataset.planToggle);
+      await dbWrite(()=>state.sb.from('payment_plans').update({active:cb.checked}).eq('id',cb.dataset.planToggle));
       await refresh(true);
       toast('Aggiornato',`Piano ${cb.checked?'riattivato':'sospeso'}`);
     }catch(e){toast('Errore',e.message,'bad')}
@@ -3516,8 +3548,8 @@ function paymentPlanFormModal(plan,presetStoreId){
         active:true,created_by:state.user.id
       };
       try{
-        if(isEdit) await state.sb.from('payment_plans').update(payload).eq('id',plan.id);
-        else await state.sb.from('payment_plans').insert(payload);
+        if(isEdit) await dbWrite(()=>state.sb.from('payment_plans').update(payload).eq('id',plan.id));
+        else await dbWrite(()=>state.sb.from('payment_plans').insert(payload));
         try{ await state.sb.rpc('generate_due_payments'); }catch(e){}
         await refresh(true);closeModal();toast('Creato','Piano di pagamento ricorrente salvato');
       }catch(e){toast('Errore',e.message,'bad')}
@@ -3561,11 +3593,11 @@ function paymentSplitModal(payment){
           const amount=Number(input.value)||0;
           const cur=existing.find(e=>e.user_id===userId);
           if(amount<=0){
-            if(cur) await state.sb.from('payment_splits').delete().eq('id',cur.id);
+            if(cur) await dbWrite(()=>state.sb.from('payment_splits').delete().eq('id',cur.id));
             continue;
           }
-          if(cur) await state.sb.from('payment_splits').update({share_amount:amount}).eq('id',cur.id);
-          else await state.sb.from('payment_splits').insert({payment_id:payment.id,organization_id:state.currentOrg.organization_id,user_id:userId,share_amount:amount});
+          if(cur) await dbWrite(()=>state.sb.from('payment_splits').update({share_amount:amount}).eq('id',cur.id));
+          else await dbWrite(()=>state.sb.from('payment_splits').insert({payment_id:payment.id,organization_id:state.currentOrg.organization_id,user_id:userId,share_amount:amount}));
         }
         await refresh(true);closeModal();toast('Salvato','Divisione del pagamento aggiornata');
       }catch(e){toast('Errore',e.message,'bad')}
@@ -3620,11 +3652,11 @@ function transferModal(toUserId){
         for(const cb of checked){
           const splitId=cb.dataset.transferSplit;
           const split=pendingSplits.find(s=>s.id===splitId);
-          await state.sb.from('payment_splits').update({transferred:true,transferred_at:new Date().toISOString(),transferred_by:state.user.id}).eq('id',splitId);
-          await state.sb.from('payment_transfers').insert({
+          await dbWrite(()=>state.sb.from('payment_splits').update({transferred:true,transferred_at:new Date().toISOString(),transferred_by:state.user.id}).eq('id',splitId));
+          await dbWrite(()=>state.sb.from('payment_transfers').insert({
             organization_id:state.currentOrg.organization_id,payment_id:split.payment_id,split_id:splitId,
             from_user:state.user.id,to_user:toUserId,amount:split.share_amount
-          });
+          }));
         }
         await logActivity('payment_transfer',null,null,'transfer_recorded',{to:toUserId,count:checked.length});
         await refresh(true);closeModal();toast('Registrato','Trasferimento interno salvato');
@@ -3748,8 +3780,8 @@ function eventFormModal(evt,presetStoreId){
       const lead=storeId?state.leads.find(l=>l.store_id===storeId):null;
       const payload={organization_id:state.currentOrg.organization_id,title,store_id:storeId,lead_id:lead?.id||null,start_at:new Date(startVal).toISOString(),color:$('#f_evt_color').value,notes:$('#f_evt_notes').value.trim()};
       try{
-        if(isEdit) await state.sb.from('events').update(payload).eq('id',evt.id);
-        else await state.sb.from('events').insert({...payload,owner_id:state.user.id});
+        if(isEdit) await dbWrite(()=>state.sb.from('events').update(payload).eq('id',evt.id));
+        else await dbWrite(()=>state.sb.from('events').insert({...payload,owner_id:state.user.id}));
         await refresh(true);closeModal();toast('Salvato','Evento salvato in calendario');
       }catch(e){toast('Errore',e.message,'bad')}
     };
@@ -3786,7 +3818,7 @@ function renderTeamPage(){
 
   $$('[data-role-change]').forEach(sel=>sel.onchange=async()=>{
     try{
-      await state.sb.from('organization_members').update({role:sel.value}).eq('organization_id',state.currentOrg.organization_id).eq('user_id',sel.dataset.roleChange);
+      await dbWrite(()=>state.sb.from('organization_members').update({role:sel.value}).eq('organization_id',state.currentOrg.organization_id).eq('user_id',sel.dataset.roleChange));
       await loadMembers();renderTeamPage();toast('Aggiornato','Ruolo modificato');
     }catch(e){toast('Errore',e.message,'bad')}
   });
@@ -3794,7 +3826,7 @@ function renderTeamPage(){
     const ok=await confirmDialog('Rimuovere questo membro?','Perderà l\u2019accesso all\u2019organizzazione immediatamente.');
     if(!ok) return;
     try{
-      await state.sb.from('organization_members').delete().eq('organization_id',state.currentOrg.organization_id).eq('user_id',b.dataset.removeMember);
+      await dbWrite(()=>state.sb.from('organization_members').delete().eq('organization_id',state.currentOrg.organization_id).eq('user_id',b.dataset.removeMember));
       await loadMembers();renderTeamPage();toast('Rimosso','Membro rimosso dall\u2019organizzazione');
     }catch(e){toast('Errore',e.message,'bad')}
   });
@@ -4032,13 +4064,13 @@ async function fireAutomation(trigger,ctx){
   if(!rule) return;
   try{
     if(rule.action==='create_task'&&ctx.leadId){
-      await state.sb.from('tasks').insert({organization_id:state.currentOrg.organization_id,lead_id:ctx.leadId,store_id:ctx.storeId,title:'Follow-up automatico',type:'follow_up',due_at:new Date(Date.now()+86400000).toISOString(),priority:'normal',created_by:state.user.id});
+      await dbWrite(()=>state.sb.from('tasks').insert({organization_id:state.currentOrg.organization_id,lead_id:ctx.leadId,store_id:ctx.storeId,title:'Follow-up automatico',type:'follow_up',due_at:new Date(Date.now()+86400000).toISOString(),priority:'normal',created_by:state.user.id}));
     }
     if(rule.action==='advance_stage'&&ctx.leadId){
       const lead=state.leads.find(l=>l.id===ctx.leadId);
-      if(lead){const idx=state.stages.findIndex(s=>s.id===lead.pipeline_stage_id);const next=state.stages[idx+1];if(next) await state.sb.from('leads').update({pipeline_stage_id:next.id}).eq('id',ctx.leadId)}
+      if(lead){const idx=state.stages.findIndex(s=>s.id===lead.pipeline_stage_id);const next=state.stages[idx+1];if(next) await dbWrite(()=>state.sb.from('leads').update({pipeline_stage_id:next.id}).eq('id',ctx.leadId))}
     }
-    if(rule.action==='mark_client'&&ctx.storeId){await state.sb.from('stores').update({status:'client'}).eq('id',ctx.storeId)}
+    if(rule.action==='mark_client'&&ctx.storeId){await dbWrite(()=>state.sb.from('stores').update({status:'client'}).eq('id',ctx.storeId))}
     toast('Automazione eseguita',rule.name);
   }catch(e){console.warn('automation failed',e)}
 }
@@ -4074,7 +4106,7 @@ function bindSettings(){
   });
   els.saveProfileBtn.onclick=async()=>{
     try{
-      await state.sb.from('organization_members').update({display_name:els.profileNameInput.value.trim(),color:els.profileColorInput.value}).eq('organization_id',state.currentOrg.organization_id).eq('user_id',state.user.id);
+      await dbWrite(()=>state.sb.from('organization_members').update({display_name:els.profileNameInput.value.trim(),color:els.profileColorInput.value}).eq('organization_id',state.currentOrg.organization_id).eq('user_id',state.user.id));
       await loadMembers();refreshProfileUi();toast('Salvato','Profilo aggiornato');
     }catch(e){toast('Errore',e.message,'bad')}
   };
@@ -4100,7 +4132,7 @@ function bindSettings(){
     const name=els.orgNameSettingsInput.value.trim();
     if(!name){toast('Errore','Il nome non può essere vuoto','bad');return}
     try{
-      await state.sb.from('organizations').update({name}).eq('id',state.currentOrg.organization_id);
+      await dbWrite(()=>state.sb.from('organizations').update({name}).eq('id',state.currentOrg.organization_id));
       state.currentOrg.name=name;renderOrgSwitcher();
       toast('Salvato','Nome organizzazione aggiornato');
     }catch(e){toast('Errore',e.message,'bad')}
@@ -4110,7 +4142,7 @@ function bindSettings(){
     if(!label){toast('Errore','Inserisci un nome','bad');return}
     try{
       const key=label.toLowerCase().replace(/[^a-z0-9]+/g,'_');
-      await state.sb.from('payment_methods').insert({organization_id:state.currentOrg.organization_id,key,label,sort_order:state.paymentMethods.length});
+      await dbWrite(()=>state.sb.from('payment_methods').insert({organization_id:state.currentOrg.organization_id,key,label,sort_order:state.paymentMethods.length}));
       await loadPaymentMethods();renderOrgSettingsPanel();els.newMethodInput.value='';
       toast('Aggiunto','Metodo di pagamento creato');
     }catch(e){toast('Errore',e.message,'bad')}
